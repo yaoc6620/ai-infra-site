@@ -6,6 +6,7 @@
 
 | 日期 | 公司 | 轮次 | 考点标签 | 自评 |
 |------|------|------|---------|------|
+| 2026-04 | 通义 | [一面](/interviews/2026-04-ty-tongyi-1st) | <span class="tag tag-cuda">CUDA</span><span class="tag tag-system">系统设计</span><span class="tag tag-vllm">推理优化</span> | <span class="score"><span class="score-dot score-ok"></span> 一般</span> |
 | 2026-04 | WXG | [一面](/interviews/2026-04-wx-wxg-1st) | <span class="tag tag-cuda">CUDA</span><span class="tag tag-system">系统设计</span><span class="tag tag-tp">并行策略</span><span class="tag tag-vllm">推理优化</span> | <span class="score"><span class="score-dot score-ok"></span> 一般</span> |
 | 2026-04 | WXG | [二面](/interviews/2026-04-wx-wxg-2nd) | <span class="tag tag-cuda">CUDA</span><span class="tag tag-vllm">vLLM</span><span class="tag tag-tp">TP</span><span class="tag tag-system">系统设计</span> | <span class="score"><span class="score-dot score-ok"></span> 一般</span> |
 

@@ -64,6 +64,7 @@ export default withMermaid(
             text: '面试复盘',
             items: [
               { text: '复盘总览', link: '/interviews/' },
+              { text: '通义 暑期实习 一面', link: '/interviews/2026-04-ty-tongyi-1st' },
               { text: 'WXG 暑期实习 一面', link: '/interviews/2026-04-wx-wxg-1st' },
               { text: 'WXG 暑期实习 二面', link: '/interviews/2026-04-wx-wxg-2nd' },
               { text: '模板示例', link: '/interviews/2026-04-xx-example' },
