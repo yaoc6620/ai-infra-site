@@ -1,5 +1,6 @@
 import { defineConfig } from 'vitepress'
 import { withMermaid } from 'vitepress-plugin-mermaid'
+import mathjax3 from 'markdown-it-mathjax3'
 
 export default withMermaid(
   defineConfig({
@@ -7,6 +8,20 @@ export default withMermaid(
     description: 'AI Infra 知识复习 & 面试复盘',
     lang: 'zh-CN',
     base: '/ai-infra-site/',
+
+    markdown: {
+      config: (md) => {
+        md.use(mathjax3)
+      },
+    },
+
+    vue: {
+      template: {
+        compilerOptions: {
+          isCustomElement: (tag) => tag.startsWith('mjx-'),
+        },
+      },
+    },
 
     themeConfig: {
       nav: [
