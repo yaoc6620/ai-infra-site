@@ -48,6 +48,7 @@ export default withMermaid(
               { text: 'vLLM 架构', link: '/knowledge/inference-engine' },
               { text: 'KV Cache', link: '/knowledge/kv-cache' },
               { text: 'Attention 优化', link: '/knowledge/attention-optimization' },
+              { text: 'FlashAttention', link: '/knowledge/flash-attention' },
             ],
           },
           {
