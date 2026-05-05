@@ -322,11 +322,98 @@ enable_batch_kv_gather: bool = False
 avoiding per-block aten::select host overhead."""
 ```
 
-### ares_mla_v1.py 核心改动（+45 行，-15 行）
+### ares_mla_v1.py 完整代码 Diff
 
-- 构造函数读取 `enable_batch_kv_gather` 配置
-- `_forward_prefill` 中以 `if self.enable_batch_kv_gather` 分支实现批量 gather
-- 原有 for 循环代码保留在 `else` 分支
+**文件**：`ares/engines/vllm_plugins/ascend/attention/ares_mla_v1.py` — `_forward_prefill` 方法
+
+#### 优化前代码（原始版本，L645-666）
+
+```python
+if has_context:
+    # recompute kv and concat
+    chunked_prefill_idx = prefill_metadata.chunked_context.chunked_prefill_idx
+    chunked_prefill_block_num = prefill_metadata.chunked_context.chunked_prefill_block_num
+    chunked_prefill_remained_token_num = prefill_metadata.chunked_context.chunked_prefill_remained_token_num
+    chunked_offset = prefill_metadata.chunked_context.cu_query_lens_list[chunked_prefill_idx]
+
+    if not self.enable_mla_split_kv_kr:
+        # ❌ N 次 for 循环，每次一个 aten::select
+        kv_c_and_k_pe_cache_list = [
+            kv_c_and_k_pe_cache[idx]
+            for idx in prefill_metadata.block_table_cpu[chunked_prefill_idx][:chunked_prefill_block_num]
+        ]
+        kv_c_and_k_pe_cache_list.append(
+            kv_c_and_k_pe_cache[prefill_metadata.block_table_cpu[chunked_prefill_idx][chunked_prefill_block_num]][:chunked_prefill_remained_token_num]
+        )
+        kv_c_and_k_pe_cache = torch.cat(kv_c_and_k_pe_cache_list, dim=0)
+
+        kv_c_normed = torch.cat([kv_c_normed[:chunked_offset], kv_c_and_k_pe_cache[..., :self.kv_lora_rank], kv_c_normed[chunked_offset:]], dim=0)
+        k_pe = torch.cat([k_pe[:chunked_offset], kv_c_and_k_pe_cache[..., self.kv_lora_rank:].unsqueeze(1), k_pe[chunked_offset:]], dim=0)
+    else:
+        # ❌ kv_c: N 次 for 循环
+        kv_c_and_k_pe_cache_list = [
+            kv_c_and_k_pe_cache[0][idx].squeeze(1)
+            for idx in prefill_metadata.block_table_cpu[chunked_prefill_idx][:chunked_prefill_block_num]
+        ]
+        kv_c_and_k_pe_cache_list.append(
+            kv_c_and_k_pe_cache[0][prefill_metadata.block_table_cpu[chunked_prefill_idx][chunked_prefill_block_num]][:chunked_prefill_remained_token_num].squeeze(1)
+        )
+        kv_c_normed = torch.cat([kv_c_normed[:chunked_offset]] + kv_c_and_k_pe_cache_list + [kv_c_normed[chunked_offset:]], dim=0)
+
+        # ❌ k_pe: 又一次 N 次 for 循环
+        kv_c_and_k_pe_cache_list = [
+            kv_c_and_k_pe_cache[1][idx]
+            for idx in prefill_metadata.block_table_cpu[chunked_prefill_idx][:chunked_prefill_block_num]
+        ]
+        kv_c_and_k_pe_cache_list.append(
+            kv_c_and_k_pe_cache[1][prefill_metadata.block_table_cpu[chunked_prefill_idx][chunked_prefill_block_num]][:chunked_prefill_remained_token_num]
+        )
+        k_pe = torch.cat([k_pe[:chunked_offset]] + kv_c_and_k_pe_cache_list + [k_pe[chunked_offset:]], dim=0)
+```
+
+#### 优化后代码（L655-681）
+
+```python
+if has_context:
+    # recompute kv and concat
+    chunked_prefill_idx = prefill_metadata.chunked_context.chunked_prefill_idx
+    chunked_prefill_block_num = prefill_metadata.chunked_context.chunked_prefill_block_num
+    chunked_prefill_remained_token_num = prefill_metadata.chunked_context.chunked_prefill_remained_token_num
+    chunked_offset = prefill_metadata.chunked_context.cu_query_lens_list[chunked_prefill_idx]
+
+    # ✅ 公共部分：构建 device 端 indices，零 H2D
+    device_block_indices = prefill_metadata.block_table[chunked_prefill_idx][:chunked_prefill_block_num].long()
+    last_block_idx = prefill_metadata.block_table_cpu[chunked_prefill_idx][chunked_prefill_block_num].item()
+
+    if not self.enable_mla_split_kv_kr:
+        # ✅ 1 次 index_select 替代 N 次 for 循环
+        full_blocks = kv_c_and_k_pe_cache.index_select(0, device_block_indices)
+        last_block = kv_c_and_k_pe_cache[last_block_idx][:chunked_prefill_remained_token_num]
+        kv_c_and_k_pe_cache = torch.cat([full_blocks.view(-1, full_blocks.shape[-1]), last_block], dim=0)
+
+        kv_c_normed = torch.cat([kv_c_normed[:chunked_offset], kv_c_and_k_pe_cache[..., :self.kv_lora_rank], kv_c_normed[chunked_offset:]], dim=0)
+        k_pe = torch.cat([k_pe[:chunked_offset], kv_c_and_k_pe_cache[..., self.kv_lora_rank:].unsqueeze(1), k_pe[chunked_offset:]], dim=0)
+    else:
+        # ✅ kv_c: 1 次 index_select + squeeze 触发格式转换
+        kv_c_full = kv_c_and_k_pe_cache[0].index_select(0, device_block_indices).squeeze(1)
+        kv_c_last = kv_c_and_k_pe_cache[0][last_block_idx][:chunked_prefill_remained_token_num].squeeze(1)
+        kv_c_normed = torch.cat([kv_c_normed[:chunked_offset], kv_c_full.view(-1, kv_c_full.shape[-1]), kv_c_last, kv_c_normed[chunked_offset:]], dim=0)
+
+        # ✅ k_pe: 1 次 index_select
+        kpe_full = kv_c_and_k_pe_cache[1].index_select(0, device_block_indices)
+        kpe_last = kv_c_and_k_pe_cache[1][last_block_idx][:chunked_prefill_remained_token_num]
+        k_pe = torch.cat([k_pe[:chunked_offset], kpe_full.view(-1, *kpe_full.shape[2:]), kpe_last, k_pe[chunked_offset:]], dim=0)
+```
+
+#### 改动要点
+
+| 改动点 | 说明 |
+|-------|------|
+| `prefill_metadata.block_table[...].long()` | 直接用 device 端 block_table 做 indices，不走 CPU |
+| `cache.index_select(0, device_block_indices)` | 1 次 kernel 完成所有 block 的 gather |
+| `last_block_idx = ...block_table_cpu[...].item()` | 只有这 1 个值需要 CPU（Python int 做切片） |
+| `.squeeze(1)` | 在 NPU 上触发 NCL→ND 格式转换，避免 cat 报错 |
+| `.view(-1, D)` 内联在 cat 参数中 | 延迟 reshape，减少中间 tensor 创建 |
 
 ---
 
