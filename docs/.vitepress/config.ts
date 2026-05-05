@@ -27,10 +27,21 @@ export default withMermaid(
       nav: [
         { text: '首页', link: '/' },
         { text: '知识库', link: '/knowledge/' },
+        { text: '美团实习', link: '/internship/' },
         { text: '面试复盘', link: '/interviews/' },
       ],
 
       sidebar: {
+        '/internship/': [
+          {
+            text: '美团实习',
+            collapsed: false,
+            items: [
+              { text: '项目总览', link: '/internship/' },
+              { text: 'KV Cache 批量 Gather 优化', link: '/internship/kv-cache-gather-optimization' },
+            ],
+          },
+        ],
         '/knowledge/': [
           {
             text: '并行策略',
