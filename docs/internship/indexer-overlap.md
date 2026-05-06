@@ -188,7 +188,7 @@ topk_block_table, valid_topk_tokens = self._topk_indices_to_block_table(
 ### 5.1 为什么用全局 Stream 而不是每次创建？
 
 ```python
-# 全局创建，复用
+# 模块顶层：全局创建，复用
 _indexer_stream = torch.cuda.Stream()
 _indexer_event = torch.cuda.Event()
 ```
@@ -196,6 +196,22 @@ _indexer_event = torch.cuda.Event()
 - CUDA Stream/Event 创建有开销（需要驱动分配资源）
 - 每层每次 forward 都需要用，创建+销毁太浪费
 - 全局复用是标准做法
+
+### 5.1.1 为什么在函数内需要 `global` 声明？
+
+```python
+def forward(self, ...):
+    global _indexer_stream
+    global _indexer_event
+    ...
+```
+
+Python 的作用域规则：如果在函数内对变量赋值，Python 默认将其视为**局部变量**。`global` 关键字显式声明"这个名字指向模块顶层的全局变量"。
+
+为什么不用 `self._indexer_stream`（实例属性）？
+- Stream/Event 是 **CUDA 设备资源**，不应绑定到 model state
+- 如果放在 `self` 上，会被 `model.state_dict()` / 序列化 / `model.to(device)` 等操作干扰
+- 全局变量 = 轻量级单例模式，进程生命周期内只创建一次，所有层共享复用
 
 ### 5.2 为什么需要 `wait_stream`？
 
