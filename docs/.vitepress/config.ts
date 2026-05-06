@@ -39,6 +39,7 @@ export default withMermaid(
             items: [
               { text: '项目总览', link: '/internship/' },
               { text: 'KV Cache 批量 Gather 优化', link: '/internship/kv-cache-gather-optimization' },
+              { text: 'Indexer 异步 Overlap', link: '/internship/indexer-overlap' },
             ],
           },
         ],
