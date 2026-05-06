@@ -2,7 +2,7 @@
 
 ## 项目背景
 
-在 DSA (Dynamic Sparse Attention) 场景中，每层 Attention 的 `indexer` 负责计算每个 token 应该 attend to 哪些 KV（topk 选择）。原实现中 indexer 在主 CUDA Stream 上同步执行，阻塞了后续无依赖的计算。通过将 indexer 放入独立 Stream 并用 Event 做延迟同步，实现与主路径计算的 **overlap 并行**。
+在 DSA (Dynamic Sparse Attention) 场景中，每层 Attention 的 `indexer` 负责计算每个 token 应该 attend to 哪些 KV（topk 选择）。原实现中 indexer 在主 CUDA Stream 上同步执行，阻塞了后续无依赖的小 tensor 计算。通过将 indexer 放入独立 Stream 并用 Event 做延迟同步，实现与主路径 MLA query 计算的 **overlap 并行**，在 decode 阶段每步节省约 **2ms**。
 
 ---
 
@@ -47,9 +47,10 @@ DeepseekV2MLAAttention.forward():
 
 ### 2.2 为什么是瓶颈
 
-- indexer 内部做了 matmul + topk 选择，**耗时不可忽略**
-- 它和后续的 `q_b_proj`、RoPE 等计算完全无依赖
+- indexer 内部做了 matmul + topk 选择，**是整个 MLA 前处理中计算最重的部分**
+- 后续的 `q_b_proj`、RoPE 等是小 tensor 计算，耗时短但被 indexer 阻塞
 - 同一 Stream 中 kernel 严格按序执行，白白浪费了 overlap 机会
+- **核心矛盾**：indexer 耗时长，但主路径上那些小计算完全不依赖它的结果
 
 ---
 
@@ -57,18 +58,18 @@ DeepseekV2MLAAttention.forward():
 
 ### 3.1 核心思想
 
-把 indexer 放到独立的 `_indexer_stream` 上执行，主 stream 不用等它完成就可以继续执行 `q_b_proj` 等操作。只有到 sparse attention 真正需要 `topk_indices` 时，才通过 Event 同步等待 indexer 完成。
+把 indexer（耗时长的部分）放到独立的 `_indexer_stream` 上执行，主 stream 不用等它完成就可以继续执行 `q_b_proj`、RoPE 等小 tensor 计算。只有到 sparse attention 真正需要 `topk_indices` 时，才通过 Event 同步等待 indexer 完成。这样主路径上的小计算被 indexer 的执行时间"吃掉"了。
 
 ### 3.2 优化后执行模式
 
 ```
-主 Stream:       [q_a_proj] → [layernorm] → [q_b_proj] → [...计算...] → [event.wait()] → [sparse attn]
-                                    ↓                                          ↑
-indexer Stream:              [wait_stream] → [indexer ████] → [event.record()]─┘
-                                              ↑ 和主 stream 的 q_b_proj 并行执行！
+主 Stream:       [q_a_proj] → [layernorm] → [q_b_proj] → [RoPE] → [event.wait()] → [sparse attn]
+                                    ↓          (小 tensor 计算)           ↑
+indexer Stream:              [wait_stream] → [indexer ████████████] → [event.record()]─┘
+                                              ↑ indexer 耗时长，把主路径小计算 overlap 掉
 ```
 
-**时间节省** = min(indexer 耗时, q_b_proj + 中间计算耗时)
+**时间节省** ≈ 主路径小 tensor 计算耗时（被 indexer 完全覆盖），实测 **~2ms/step**
 
 ### 3.3 同步机制详解
 
@@ -239,7 +240,18 @@ attn_metadata.sparse.indexer_event = None
 
 防止后续代码重复 `event.wait()`（虽然重复 wait 不会出错，但浪费时间），也是防御性编程。
 
-### 5.5 非 sparse 场景为什么走原路径？
+### 5.5 为什么只在 Decode 阶段有效？
+
+Decode 阶段：每个 token 逐个生成，MLA query 侧的 `q_b_proj`、RoPE 等是**小 tensor 计算**（batch 小），而 indexer 需要对所有历史 KV 做 topk 选择，耗时相对大。此时 overlap 可以把主路径小计算完全藏在 indexer 背后，节省约 2ms。
+
+Prefill 阶段：一次处理大量 token（如 64K），主路径的 `q_b_proj` 等计算本身就是**大矩阵乘法**，GPU 计算密集度高，SM 已经被充分利用。此时：
+- 两个 stream 的 kernel 争抢 SM 资源，反而可能互相拖慢
+- 大矩阵计算本身耗时远超 indexer，overlap 节省的那点时间占比极小
+- Prefill 的瓶颈在 attention 计算本身，不在 indexer
+
+因此，**此优化建议只在 decode 阶段启用**。
+
+### 5.6 非 sparse 场景为什么走原路径？
 
 ```python
 else:
@@ -286,9 +298,9 @@ use(result)                                             # 安全使用
 
 ::: details 面试时怎么讲？（1 分钟版本）
 
-"在 Sparse Attention 中，有一个 indexer 模块负责为每个 token 计算 topk 相关的 KV block。它的结果要到最后 sparse attention 时才被用到，但原来在主 stream 上同步执行，阻塞了中间的 q_b_proj 等无依赖计算。
+"在 DSA Sparse Attention 的 decode 阶段，indexer 需要为每个 token 计算 topk 相关的 KV block，是 MLA 前处理中计算最重的部分。但它的结果要到最后 sparse attention 时才被用到，中间的 q_b_proj、RoPE 等小 tensor 计算被它阻塞了。
 
-我把 indexer 放到独立的 CUDA Stream 上异步执行，通过 Event 做延迟同步——主 stream 在真正需要 topk 结果时才 wait。这样 indexer 和 q_b_proj 可以并行执行，减少了整体的串行等待时间。"
+我把 indexer 放到独立的 CUDA Stream 上异步执行，通过 Event 做延迟同步。这样主路径上的小计算可以和 indexer 并行，被 indexer 的执行时间 overlap 掉，每步节省约 2ms。注意这个优化只在 decode 阶段有效——prefill 阶段计算密集，SM 利用率高，overlap 收益可忽略。"
 
 :::
 
@@ -302,9 +314,13 @@ A: 只有无数据依赖的计算才能 overlap。如果有依赖（比如 q_b_p
 
 A: `event.wait()` 是 **GPU 端同步**——让当前 stream 等待另一个 stream 的 event，不阻塞 CPU。`cudaDeviceSynchronize()` 是 **CPU 端同步**——CPU 等所有 GPU 工作完成，会阻塞 CPU。这里用 event.wait() 不会引入 CPU 阻塞。
 
-**Q: 如果 indexer 比 q_b_proj 慢很多，overlap 还有用吗？**
+**Q: indexer 比主路径计算慢很多，overlap 效果如何？**
 
-A: 有用但收益缩小。Overlap 节省的时间 = min(indexer, 主路径中间计算)。如果 indexer 远慢于中间计算，主 stream 到 event.wait() 时还是要等一段时间。但至少比完全串行少了"中间计算"那段时间。
+A: 这里正是这种情况——indexer 是耗时长的部分，主路径的 q_b_proj/RoPE 是小计算。Overlap 节省的时间 = 主路径小计算的耗时（约 2ms），因为它们被完全藏在 indexer 背后了。indexer 本身耗时没变，但主路径小计算从"串行等待"变成了"免费执行"。
+
+**Q: 为什么只在 decode 有效，prefill 没收益？**
+
+A: Prefill 一次处理大量 token，q_b_proj 等变成大矩阵乘法，SM 已经被打满。两个 stream 的 kernel 争抢 SM 反而互相拖慢，且大计算本身远超 indexer 耗时，overlap 占比极小。
 
 **Q: 全局 Stream 有线程安全问题吗？**
 
