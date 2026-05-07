@@ -10,6 +10,7 @@
 |---------|------|------|
 | [KV Cache 批量 Gather](/internship/kv-cache-gather-optimization) | for 循环 → index_select，消除 host bound | -5.2% |
 | [Indexer 异步 Overlap](/internship/indexer-overlap) | CUDA Stream Event 异步，decode 阶段 ~2ms/step | decode 阶段有效 |
+| [Multi-Stream NaN 修复](/internship/multi-stream-nan-fix) | 多 Stream + CUDA Graph 内存复用 NaN，record_stream + shared stream | 稳定性修复 |
 | All-to-All EP 通信 | MoE 通信模式优化，减少通信量 | -13.1% (累计) |
 | MLA Absorb | 长 KV context 下减少计算量 | -30.8% (累计) |
 | mla_prolog 融合算子 | 12 个零散算子融合为 1 个 kernel | -42.3% (累计) |
