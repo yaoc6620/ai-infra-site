@@ -104,16 +104,54 @@ for i, layer in enumerate(self.layers):
 
 → 确认是 **多 stream + CUDA Graph 组合** 导致的内存问题。
 
-#### Step 3：推理 root cause
+#### Step 3：确认是内存复用问题（排除计算错误）
 
-到这一步不是靠 print debug 了，是靠**分析 PyTorch caching allocator 的内存模型**：
-- CUDA Graph capture 期间 `process_events()` 被禁用
+使用环境变量**禁用 caching allocator**：
+
+```bash
+PYTORCH_NO_CUDA_MEMORY_CACHING=1 python run.py
+```
+
+这个环境变量让 PyTorch 彻底跳过 caching allocator——每次分配直接调 `cudaMalloc()`（全新地址），每次释放直接调 `cudaFree()`（隐式同步所有 stream 后才真正释放）。**没有内存复用**，不可能出现"别的 stream 还在读就被覆写"。
+
+| 模式 | NaN? | 说明 |
+|------|------|------|
+| 默认 caching allocator | ✅ NaN | 有内存复用 → 复用出错 |
+| `PYTORCH_NO_CUDA_MEMORY_CACHING=1` | ❌ 安全 | 无复用 → 排除 kernel 计算逻辑错误 |
+
+NaN 消失 → **100% 确认是分配器的内存复用策略出了问题**，不是计算逻辑算错了。
+
+（注：禁用缓存后每次 alloc/free 走驱动调用，性能下降 10x~100x，只用于 debug。）
+
+还可以配合 `CUDA_LAUNCH_BLOCKING=1`：
+
+```bash
+CUDA_LAUNCH_BLOCKING=1 python run.py
+```
+
+让所有 CUDA kernel 同步执行（每个 launch 后立刻等完成）。如果 NaN 消失 → 确认是**异步执行的时序竞争**。
+
+#### Step 4：推理 root cause
+
+到这一步靠**分析 PyTorch caching allocator 的内存模型**：
+- CUDA Graph capture 期间 `process_events()` 被禁用（不然 OOM）
 - 跨 stream 使用 tensor 但没有 `record_stream()` 告知分配器
 - 两个条件叠加 → 内存被提前复用 → 脏数据 → NaN
 
-#### Step 4：验证假设
+#### Step 5：验证假设
 
 加 `record_stream()` → NaN 消失 → 确认 root cause。
+
+#### 排查工具总结
+
+| 工具/手段 | 用途 |
+|-----------|------|
+| 控制变量开关 | 定位是哪两个特性组合触发 |
+| `PYTORCH_NO_CUDA_MEMORY_CACHING=1` | 确认是分配器复用问题，排除计算错误 |
+| `CUDA_LAUNCH_BLOCKING=1` | 确认是异步时序问题 |
+| eager 模式逐层 nan check | 定位出问题的层（Graph 外检查） |
+| Nsight Systems (`nsys profile`) | 看 timeline 上多 stream kernel 重叠情况，确认竞争窗口存在 |
+| 分析 PyTorch allocator 源码/文档 | 理解 process_events、record_stream 机制推导 root cause |
 
 ### 2.3 Root Cause：三个问题叠加
 
