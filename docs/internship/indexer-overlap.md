@@ -251,7 +251,43 @@ Prefill 阶段：一次处理大量 token（如 64K），主路径的 `q_b_proj`
 
 因此，**此优化建议只在 decode 阶段启用**。
 
-### 5.6 非 sparse 场景为什么走原路径？
+### 5.6 与 CUDA Graph 配合：潜在的内存安全问题
+
+indexer overlap 同样涉及跨 stream 使用 tensor——`hidden_states` 和 `q_c` 在主 stream 上创建，但在 `_indexer_stream` 上被 indexer 读取。如果配合 CUDA Graph 使用，存在和 MoE multi-stream 相同的隐患：
+
+**问题场景**：
+```python
+q_c = self.q_a_layernorm(q_c)          # 主 stream 上创建 q_c
+
+with torch.cuda.stream(_indexer_stream):
+    self.indexer(hidden_states, q_c, ...)  # indexer stream 读 q_c
+
+q = self.q_b_proj(q_c)[0]              # 主 stream 继续用 q_c → 之后 q_c 引用可能归零
+# 如果 q_c 被回收，而 _indexer_stream 还在读 → 脏数据
+```
+
+**防护写法**：加 `record_stream()` 保护跨 stream 使用的 tensor：
+
+```python
+global _indexer_stream
+global _indexer_event
+current_stream = torch.cuda.current_stream()
+_indexer_stream.wait_stream(current_stream)
+
+# ✅ 告诉分配器这些 tensor 在 indexer stream 上也被使用
+hidden_states.record_stream(_indexer_stream)
+q_c.record_stream(_indexer_stream)
+
+with torch.cuda.stream(_indexer_stream):
+    self.indexer(hidden_states, q_c, rotary_emb)
+    _indexer_event.record()
+```
+
+**为什么当前代码没加也没出 NaN？**
+
+因为 `hidden_states` 和 `q_c` 在 indexer stream 使用后，主 stream 后续还在持续使用它们（`q_b_proj(q_c)` 等），Python 引用计数不会归零。但这依赖于后续代码的具体写法——如果未来重构导致引用提前释放，就会出 NaN。加 `record_stream()` 是防御性编程，确保安全。
+
+### 5.7 非 sparse 场景为什么走原路径？
 
 ```python
 else:

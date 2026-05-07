@@ -70,7 +70,31 @@ class ParallelShortcutTransformerLayer(nn.Module):
 
 ### 2.2 排查过程
 
-**控制变量定位**：
+#### Step 1：检测 NaN 的位置
+
+CUDA Graph 内部不能 print、不能做依赖 tensor 值的 Python 分支（因为 Graph 只录 CUDA op，不执行 Python 逻辑）。所以 NaN 检测只能在 **Graph 外部**做：
+
+```python
+# Graph replay 后检查 output buffer（replay 完成后 output_buffer 是普通 tensor）
+graph.replay()
+if torch.isnan(output_buffer).any():
+    print(f"NaN detected! Step {step}")
+```
+
+也可以在每层 Graph 之间（如果是 per-layer Graph）或 eager fallback 模式下逐层检查：
+
+```python
+# eager 模式下逐层定位
+for i, layer in enumerate(self.layers):
+    output = layer(...)
+    if torch.isnan(output).any():
+        print(f"Layer {i} output has NaN!")
+        break
+```
+
+发现 NaN 出现的层不固定 → 排除数值溢出（数值溢出一般在固定位置），指向内存被覆写。
+
+#### Step 2：控制变量定位
 
 | 配置 | NaN? | 结论 |
 |------|------|------|
@@ -80,7 +104,16 @@ class ParallelShortcutTransformerLayer(nn.Module):
 
 → 确认是 **多 stream + CUDA Graph 组合** 导致的内存问题。
 
-（注：CUDA Graph 内部不能 print/做 Python 分支，NaN check 是在 `graph.replay()` 之后对 output buffer 检查的。）
+#### Step 3：推理 root cause
+
+到这一步不是靠 print debug 了，是靠**分析 PyTorch caching allocator 的内存模型**：
+- CUDA Graph capture 期间 `process_events()` 被禁用
+- 跨 stream 使用 tensor 但没有 `record_stream()` 告知分配器
+- 两个条件叠加 → 内存被提前复用 → 脏数据 → NaN
+
+#### Step 4：验证假设
+
+加 `record_stream()` → NaN 消失 → 确认 root cause。
 
 ### 2.3 Root Cause：三个问题叠加
 
