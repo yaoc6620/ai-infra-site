@@ -373,6 +373,51 @@ class ParallelTransformer(nn.Module):
 
 ## 五、核心知识点
 
+### 5.0 多 Stream 下的显存复用机制
+
+PyTorch caching allocator 内部按 **stream 分桶**维护 free list。复用规则分两种情况：
+
+#### 同 stream 复用：直接拿，不需要任何检查
+
+```
+dense_stream 的 free list: [地址 0x1000, 200MB] [地址 0x2000, 50MB] ...
+
+dense_stream 上有新 alloc 请求 → 直接从这个桶里拿一块大小合适的 → 完成
+```
+
+为什么安全？同一 stream 上的 kernel 严格顺序执行。free 发生在 alloc 之前（代码顺序 = 执行顺序），说明前面的 kernel 一定用完了这块地址，后面的 kernel 可以安全写入。
+
+#### 跨 stream 复用：需要 process_events() 检查
+
+```
+default_stream 的 free list: [地址 0x3000, 100MB]
+
+dense_stream 上有 alloc 请求，自己桶里没空闲块 → 看别的桶
+→ default_stream 桶里有一块 → 能拿吗？
+```
+
+**不能直接拿**。因为两个 stream 并发执行，`default_stream` 上虽然 Python 引用归零了（触发了 free），但 `default_stream` 上后续的 kernel 可能还在读这块地址。
+
+此时分配器调 `process_events()` 检查：
+- event 已 complete（原 stream 上的 kernel 真跑完了）→ 安全，给 `dense_stream` 用
+- event 没 complete → 不给，继续等或者新分配
+
+#### CUDA Graph 下跨 stream 复用为什么出问题
+
+```
+default_stream 的 free list: [地址 0x3000, 100MB]
+
+dense_stream 想 alloc →
+  自己桶里没有 →
+  看别的桶？ →
+  正常 eager：process_events() 检查 → event complete 才给 → 安全
+  Graph capture：process_events() 禁用 → 没有保护 → 直接给了 → 出事！
+```
+
+Graph capture 下禁用了 `process_events()`，跨 stream 复用失去保护。这就是为什么需要 `record_stream()` 来手动标记 tensor 的跨 stream 生命周期。
+
+---
+
 ### 5.1 process_events() 是什么
 
 `process_events()` 是 PyTorch caching allocator 内部的一个**垃圾回收检查函数**（不是"等待事件"，不阻塞）。
