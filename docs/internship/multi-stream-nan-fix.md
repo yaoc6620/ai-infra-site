@@ -448,6 +448,60 @@ tensor.record_stream(other_stream)
 
 在 Graph capture 下 `process_events()` 被禁用，但 `record_stream()` 的 tag 仍然有效——分配器看到 tag 存在就不会把这块内存放回 free list 给同 stream 的后续 alloc 复用。
 
+### 5.8 process_events() vs event.wait()：容易混淆的两个概念
+
+名字里都有 "event"，但完全不同：
+
+| | process_events() | event.wait() / stream.wait_event() |
+|---|---|---|
+| 层面 | **内存管理** | **执行顺序控制** |
+| 谁调 | 分配器内部自动调 | 你手动写 |
+| 目的 | 决定显存块能不能回收 | 决定 kernel 能不能开始执行 |
+| 阻塞 | 不阻塞任何东西（只是 query 状态） | 阻塞**当前 stream** 的后续 kernel |
+| 类比 | GC 检查"对象还有人引用吗" | 线程 join / barrier |
+
+#### event.wait() 的特性
+
+`event.wait()` 只能让**当前 stream 等别人**，不能让别人等自己。每个 stream 只管理自己的执行顺序：
+
+```python
+# Stream A 做完某件事后记录 event
+with torch.cuda.stream(stream_A):
+    compute_something()
+    my_event.record()           # "我完成了，记录一下"
+
+# Stream B 自己决定要不要等 A
+with torch.cuda.stream(stream_B):
+    my_event.wait()             # B 选择等 A → B 后续 kernel 排队
+    use_result()                # 保证在 A 完成之后执行
+
+# Stream C 不 wait → 不受任何影响
+with torch.cuda.stream(stream_C):
+    other_work()                # 和 A、B 完全无关，继续跑
+```
+
+类似 pub/sub 模式：
+- `event.record()` = 发布"我做完了"这个信号
+- `event.wait()` = 订阅者说"我要等这个信号再继续"
+- 只有主动订阅（调 wait）的 stream 才会被阻塞，没有机制能"强制让别的 stream 停下来"
+
+#### 在本项目中的应用
+
+```python
+# MoE multi-stream overlap 中的 event 使用（执行顺序控制）
+with torch.cuda.stream(dense_stream):
+    hidden_states = self.mlps[0](hidden_states)
+    event_rs0_done.record()                          # dense 第一阶段完成
+
+with torch.cuda.stream(moe_stream):
+    top_experts = self.mlp.do_router(original_hidden_states)
+    torch.cuda.current_stream().wait_event(event_rs0_done)  # moe stream 等 dense 第一阶段
+    # 这里 moe 需要某个依赖 dense 结果的数据，所以要等
+    expert_output = self.mlp.all2all_comm.dispatch(...)
+```
+
+这些 event 控制的是"谁先执行谁后执行"，和 `process_events()`（内存回收检查）完全无关。
+
 ---
 
 ## 六、面试讲述要点
