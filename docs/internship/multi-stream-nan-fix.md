@@ -335,42 +335,118 @@ class ParallelTransformer(nn.Module):
 
 ## 五、核心知识点
 
-### 5.1 PyTorch Caching Allocator 内存回收机制
+### 5.1 process_events() 是什么
+
+`process_events()` 是 PyTorch caching allocator 内部的一个**垃圾回收检查函数**（不是"等待事件"，不阻塞）。
+
+#### 它解决什么问题
+
+当 tensor 被 `record_stream(other_stream)` 标记过后 Python 引用归零，分配器不会立刻回收这块显存，而是放进一个**待定队列**，同时记录一个 event。`process_events()` 负责遍历这个队列，检查每个 event 的完成状态：
 
 ```
-Python 引用计数 → 0
-        ↓
-分配器将显存放回 free list（按创建 stream 分桶）
-        ↓
-其他 alloc 请求时，调 process_events() 检查 free 块是否安全
-        ↓
-安全（event complete）→ 可复用
-不安全（event 未 complete）→ 暂不复用
+待定队列：
+  [tensor A 的地址, event_1]  →  event_1 complete?  → Yes → 放回 free list，可复用
+  [tensor B 的地址, event_2]  →  event_2 complete?  → No  → 继续等，暂不回收
+  [tensor C 的地址, event_3]  →  event_3 complete?  → Yes → 放回 free list，可复用
 ```
 
-### 5.2 record_stream() 的作用
+#### 什么时候被调用
+
+**自动调用**，不需要手动写。每次 `torch.empty()` / 任何 tensor 分配时，分配器内部会先调 `process_events()` 看看有没有可以回收的块，再决定是从 free list 复用还是新申请。
+
+#### 类比
+
+类似于 Java/Go 的 GC mark-sweep：
+- `record_stream()` = 标记"这个对象还有别的引用者"
+- `process_events()` = GC 扫描一遍"那些引用者都用完了吗？用完就回收"
+
+### 5.2 为什么 CUDA Graph capture 时要禁用 process_events()
+
+Graph capture 的本质是"录制"——kernel 只被记录到 Graph 里，**不真正执行**。
+
+问题：`process_events()` 依赖 event 的完成状态来判断是否可以回收。但 capture 期间 kernel 不执行 → event **永远不会 complete**。
+
+如果不禁用：
+```
+process_events() 扫描 → 所有 event 都 incomplete → 一个都不能回收
+→ 后续 alloc 全部要调 cudaMalloc 申请新显存 → OOM
+```
+
+所以 PyTorch 的策略：**capture 期间禁用 process_events()，但允许同一个 stream 上的 free 块立刻被后续 alloc 复用**。
+
+为什么同一 stream 复用是安全的？因为同一 stream 上的 kernel **严格按序执行**——录制顺序就是执行顺序，如果 free 在 alloc 之前录制，那 replay 时也一定是先执行完 free 前面的 kernel 再执行 alloc 后面的 kernel。
+
+但**跨 stream** 就没有这个顺序保证 → 没有 `process_events()` 兜底 → 完全裸奔。这就是为什么需要 `record_stream()`。
+
+### 5.3 为什么一开始选择 Per-layer Stream
+
+发现 NaN 后，最直觉的修复思路是：**既然全局 stream 跨层复用出问题，那就让每层有自己的 stream，切断跨层干扰**。
+
+```python
+# 每层独立 stream → Layer 0 free 的块不会被 Layer 1 复用
+self._dense_stream = torch.cuda.Stream()
+self._moe_stream = torch.cuda.Stream()
+```
+
+Per-layer stream 的逻辑：
+- 不同层的 stream 是不同对象 → 分配器按 stream 分桶 → 跨层不会互相复用
+- 再加上 `record_stream()` 保护跨 stream（dense ↔ moe ↔ default）的 tensor
+- 双保险，NaN 确实修复了
+
+### 5.4 Per-layer Stream 为什么导致显存爆炸
+
+CUDA Graph capture 时分配器为**每个 stream** 维护独立的 free list。Per-layer 创建了 N×2 个 stream（60 层 = 120 个 stream），它们的 free 块互相看不到：
+
+```
+Layer 0 _dense_stream: [alloc 200MB] → [free 200MB]   ← 只有 layer 0 自己能复用
+Layer 1 _dense_stream: [alloc 200MB] → [free 200MB]   ← 只有 layer 1 自己能复用
+...
+Layer 59 _dense_stream: [alloc 200MB] → [free 200MB]  ← 只有 layer 59 自己能复用
+```
+
+每层都独占一份中间 tensor 的显存，即使结构完全相同（每层用完就 free 了），也无法跨层复用。60 层 × ~2GB = 爆炸。
+
+### 5.5 Shared Stream 为什么能同时解决 NaN 和显存
+
+#### 解决显存：同一 stream 上可直接复用
+
+```
+shared_dense_stream:
+  Layer 0 [alloc A] → [用 A] → [free A] → Layer 1 [alloc B 复用 A 的地址!] → [用 B] → [free B] → ...
+```
+
+同一个 stream，顺序执行保证安全。分配器**不需要 `process_events()`** 就敢复用 → Graph capture 下也正常工作。总共只需 1 份中间 tensor 的显存。
+
+#### 不再 NaN：record_stream 仍在保护
+
+shared stream 其实回到了和"最初全局 stream"相同的结构。但关键区别是：**阶段 1 已经加了 `record_stream()`**。
+
+- 最初：shared stream + 没有 record_stream → 分配器不知道跨 stream 使用 → NaN
+- 现在：shared stream + 有 record_stream → 分配器知道 tensor 完整生命周期 → 安全
+
+`record_stream()` 是独立于 stream 是否共享/per-layer 的保护机制。
+
+### 5.6 三阶段对比
+
+| 阶段 | Stream 方式 | record_stream | process_events 可用? | NaN | 显存 |
+|------|------------|---------------|---------------------|-----|------|
+| 最初 | 全局共享 | ❌ | Graph 下禁用 | ❌ NaN | 正常 |
+| 修复 1 | Per-layer | ✅ | Graph 下禁用（但不需要，因为不跨层复用） | ✅ 安全 | 爆炸 |
+| 修复 2 | 共享（模型级别） | ✅ | Graph 下禁用（但不需要，同 stream 直接复用） | ✅ 安全 | 正常 |
+
+### 5.7 record_stream() 的内部实现
 
 ```python
 tensor.record_stream(other_stream)
 ```
 
-告诉分配器："这个 tensor 在 `other_stream` 上也被使用。即使 Python 引用归零，也不要回收，直到 `other_stream` 上的相关 work 完成。"
+内部做了什么：
+1. 在 `other_stream` 上记录一个 event（标记当前 stream 进度）
+2. 给这块内存打一个 `(other_stream, event)` tag
+3. 当 Python 引用归零触发 free 时，分配器不立刻回收，而是放入待定队列
+4. 后续 `process_events()` 检查该 event 是否 complete，complete 后才真正回收
 
-### 5.3 CUDA Graph capture 下的特殊行为
-
-| 机制 | Eager 模式 | Graph Capture 模式 |
-|------|-----------|-------------------|
-| process_events() | 每次 alloc 自动调用 | **禁用** |
-| 同一 stream free → alloc | 安全复用 | 安全复用 |
-| 跨 stream free → alloc | process_events 兜底 | **无保护，需 record_stream** |
-
-### 5.4 三阶段对比
-
-| 阶段 | Stream 方式 | record_stream | NaN | 显存 |
-|------|------------|---------------|-----|------|
-| 最初 | 全局共享 | ❌ | ❌ NaN | 正常 |
-| 修复 1 | Per-layer | ✅ | ✅ 安全 | 爆炸 |
-| 修复 2 | 共享（模型级别） | ✅ | ✅ 安全 | 正常 |
+在 Graph capture 下 `process_events()` 被禁用，但 `record_stream()` 的 tag 仍然有效——分配器看到 tag 存在就不会把这块内存放回 free list 给同 stream 的后续 alloc 复用。
 
 ---
 
