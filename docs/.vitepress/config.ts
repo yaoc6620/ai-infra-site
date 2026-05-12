@@ -56,11 +56,21 @@ export default withMermaid(
             ],
           },
           {
-            text: '推理引擎',
+            text: 'vLLM 推理引擎',
             collapsed: false,
             items: [
-              { text: 'vLLM 架构', link: '/knowledge/inference-engine' },
-              { text: 'KV Cache', link: '/knowledge/kv-cache' },
+              { text: '总体架构', link: '/knowledge/vllm/' },
+              { text: 'Scheduler 调度', link: '/knowledge/vllm/scheduling' },
+              { text: 'KV Cache 管理', link: '/knowledge/vllm/kv-cache' },
+              { text: 'CUDA Graph', link: '/knowledge/vllm/cuda-graph' },
+              { text: 'Model Runner', link: '/knowledge/vllm/model-runner' },
+              { text: '投机解码', link: '/knowledge/vllm/speculative-decoding' },
+            ],
+          },
+          {
+            text: 'Attention',
+            collapsed: false,
+            items: [
               { text: 'Attention 优化', link: '/knowledge/attention-optimization' },
               { text: 'FlashAttention', link: '/knowledge/flash-attention' },
             ],
