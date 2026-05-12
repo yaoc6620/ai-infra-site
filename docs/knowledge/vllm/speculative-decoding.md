@@ -155,7 +155,61 @@ Target model hidden_state → Head 0: 预测 pos+1
 - 优点：比 Medusa 准确率高（有自回归依赖）
 - 缺点：实现更复杂
 
-### 4. Self-Speculative
+### 4. MTP — Multi-Token Prediction（非 vLLM 原生）
+
+::: warning 非 vLLM 原生
+MTP 是 DeepSeek-V3 / R1 的投机解码方案，在 ares 框架中实现（longcat_mtp）。vLLM 开源版有 Eagle 但不含 MTP。
+:::
+
+DeepSeek-V3 在训练时就有 MTP 结构（`num_nextn_predict_layers`），推理时直接复用这些层作为 draft head，不需要额外训练。
+
+**MTP Layer 结构**：
+
+```python
+class MtFlashMoeMultiTokenPredictorLayer(nn.Module):
+    def __init__(self, config):
+        self.enorm = RMSNorm(config.hidden_size)     # embedding 归一化
+        self.hnorm = RMSNorm(config.hidden_size)     # hidden state 归一化
+        self.eh_proj = Linear(hidden_size * 2, hidden_size)  # 拼接投影
+        self.transformer_layer = ParallelTransformerLayer(config)  # 一层完整 Transformer
+        self.final_layernorm = RMSNorm(config.hidden_size)
+
+    def forward(self, decoder_input, positions, previous_hidden_states):
+        decoder_input = self.enorm(decoder_input)
+        previous_hidden_states = self.hnorm(previous_hidden_states)
+        # 拼接 token embedding + target 模型的 hidden state → 投影
+        hidden_states = self.eh_proj(
+            torch.cat([decoder_input, previous_hidden_states], dim=-1))
+        # 过一层 Transformer（含 Attention + MLP）
+        hidden_states = self.transformer_layer(hidden_states, positions)
+        return self.final_layernorm(hidden_states)
+```
+
+**自回归 Draft 循环**（在 `EagleProposer.propose` 中）：
+
+```python
+all_draft_token_ids = []
+for step in range(num_speculative_tokens):
+    # MTP forward: 输入 = 上一步 token embedding + target hidden state
+    hidden_states = mtp_model(input_ids, positions, previous_hidden_states)
+
+    # 贪心采样 draft token
+    logits = mtp_model.compute_logits(hidden_states[last_token_indices])
+    tokens = logits.argmax(dim=-1)
+    all_draft_token_ids.append(tokens)
+
+    # 下一步：position +1, slot_mapping +1, 用新 token 的 embedding
+    positions[last_token_indices] += 1
+    input_ids[last_token_indices] = tokens
+    previous_hidden_states[:] = hidden_states  # 传递 hidden state
+```
+
+**MTP vs Eagle 的区别**：
+- Eagle：需要**额外训练**一个 draft head，和 target model 是分开的
+- MTP：DeepSeek-V3 训练时就包含 MTP 层，推理时直接复用，**零额外训练成本**
+- 两者的推理流程几乎一样：自回归生成 K 个 draft token → target verify
+
+### 5. Self-Speculative
 
 利用 target model 自身做推测：跳过部分层做 draft，完整层做 verify。
 
