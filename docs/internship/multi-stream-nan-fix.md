@@ -8,7 +8,32 @@
 
 ## 一、MoE 层的多 Stream Overlap 结构
 
-### 1.1 为什么要多 Stream
+### 1.1 为什么要做 Overlap（Profiling 分析）
+
+从 Nsight Systems / Ascend Profiler 的 decode 阶段 timeline 上观察单层 `ParallelShortcutTransformerLayer`：
+
+```
+decode 阶段 timeline（单层，原始串行）:
+
+主 Stream:
+  [shortcut MLP₀ 0.5ms] → [attention 1.2ms] → [shortcut MLP₁ 0.4ms] → [MoE router 0.2ms] → [all2all 1.5ms] → [experts 2.0ms] → [combine 1.0ms] → [output add]
+                                                                          ↑_________________ MoE path ____________________↑
+  ↑________________________ Dense path ___________________________↑
+
+  总耗时 ≈ 6.8ms/layer
+```
+
+**关键观察**：
+- Dense path（MLP₀ → Attention → MLP₁）和 MoE path（router → dispatch → experts → combine）**共享同一个输入 tensor**，但计算过程**无数据依赖**
+- 两条路径各自耗时都不小（dense ~2.1ms，MoE ~4.7ms），串行白白浪费
+- 如果并行：总耗时 ≈ max(dense, MoE) ≈ 4.7ms，节省 ~2.1ms/layer
+- 60 层 × 2.1ms ≈ 每步 ~126ms 的理论上限（实际因同步开销和 SM 竞争会少一些）
+
+**为什么 Decode 有效**：Decode 阶段 batch 小、单个 kernel 计算量小，GPU SM 有富余。两个 stream 的 kernel 可以分别占用不同 SM 并行执行。
+
+**为什么 Prefill 不做**：Prefill 的矩阵乘法是大 kernel，单个 kernel 就能打满 SM。两个 stream 的 kernel 争抢 SM 反而互相拖慢。
+
+### 1.2 两条计算路径
 
 每层 `ParallelShortcutTransformerLayer` 包含两条计算路径：
 
@@ -27,7 +52,7 @@ dense_stream:               └─ [mlps[0]] → [attn] → [mlps[1]] ──┐
 moe_stream:                 └─ [router] → [dispatch] → [experts] → [combine] ──┘
 ```
 
-### 1.2 原始实现：全局共享 Stream
+### 1.3 原始实现：全局共享 Stream
 
 ```python
 # 模块顶层
