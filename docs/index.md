@@ -21,7 +21,7 @@ features:
   - icon: "⚡"
     title: 推理引擎
     details: vLLM 架构、PagedAttention、Continuous Batching、KV Cache 管理
-    link: /knowledge/inference-engine
+    link: /knowledge/vllm/
   - icon: "\U0001F4BB"
     title: CUDA 编程
     details: Kernel 编写、内存层次、Warp/Block 调度、性能优化
