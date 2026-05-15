@@ -34,14 +34,20 @@ export default withMermaid(
       sidebar: {
         '/internship/': [
           {
-            text: '美团实习',
+            text: '优化项目',
             collapsed: false,
             items: [
-              { text: '项目总览', link: '/internship/' },
               { text: 'KV Cache 批量 Gather 优化', link: '/internship/kv-cache-gather-optimization' },
               { text: 'Indexer 异步 Overlap', link: '/internship/indexer-overlap' },
               { text: 'Indexer AICPU 消除', link: '/internship/indexer-aicpu-elimination' },
               { text: 'Multi-Stream NaN 修复', link: '/internship/multi-stream-nan-fix' },
+            ],
+          },
+          {
+            text: '原理解析',
+            collapsed: false,
+            items: [
+              { text: 'DCP Attention 原理', link: '/internship/dcp-attention' },
             ],
           },
         ],
