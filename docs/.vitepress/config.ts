@@ -47,6 +47,7 @@ export default withMermaid(
             text: '原理解析',
             collapsed: false,
             items: [
+              { text: 'MLA 低秩压缩与 TP 切分', link: '/internship/mla-tp' },
               { text: 'DCP Attention 原理', link: '/internship/dcp-attention' },
             ],
           },
