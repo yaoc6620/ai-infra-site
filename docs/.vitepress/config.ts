@@ -42,6 +42,7 @@ export default withMermaid(
               { text: 'Indexer AICPU 消除', link: '/internship/indexer-aicpu-elimination' },
               { text: 'Multi-Stream NaN 修复', link: '/internship/multi-stream-nan-fix' },
               { text: 'Indexer DCP 并行优化', link: '/internship/indexer-dcp-parallel' },
+              { text: 'DCP Decode All2All 优化', link: '/internship/dcp-decode-alltoall' },
             ],
           },
           {
