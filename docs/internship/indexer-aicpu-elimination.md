@@ -16,6 +16,65 @@ def _compute_local_indices(self, topk_indices: torch.Tensor) -> torch.Tensor:
 
 **问题**：NPU 910C 上 int32 的 `%`（FloorMod）和 `//`（FloorDiv）没有 AICORE 实现，退化到 **AICPU** 执行（串行、慢、有调度切换开销）。
 
+### 逐行解读：`_compute_local_indices` 做了什么
+
+这个函数的作用是**把全局 TopK 索引翻译成当前 DCP rank 的本地索引**。
+
+假设 `dcp_size=4, dcp_rank=1`，某个 token 的 TopK 结果为 `[7, 2, 5, 12, -1]`：
+
+**第一行：`keep` 掩码——哪些 position 属于我**
+
+```python
+keep = (topk_indices != -1) & ((topk_indices % self.dcp_size) == self.dcp_rank)
+```
+
+DCP 的 KV 分布是 round-robin：position 0 → rank 0, position 1 → rank 1, ..., position 4 → rank 0, ...。`global_idx % dcp_size` 就是归属的 rank。
+
+```
+index:  7   2   5   12  -1
+%4:     3   2   1   0   —
+==1?    ✗   ✗   ✓   ✗   ✗
+keep:   F   F   T   F   F       ← 只有全局索引 5 属于 rank 1
+```
+
+**第二行：全局索引 → 本地地址**
+
+```python
+topk_indices = torch.where(keep, topk_indices // self.dcp_size, -1)
+```
+
+rank 1 存的是全局 position 1, 5, 9, 13, ...，对应本地 position 0, 1, 2, 3, ...。`global // dcp_size` 就是本地地址：
+
+```
+全局 5 → 5 // 4 = 1（本地第 1 个 position）
+不属于自己的 → -1
+
+结果: [-1, -1, 1, -1, -1]
+```
+
+**第三四行：把有效索引排到前面（GPU-friendly compact）**
+
+```python
+_, order = torch.sort((topk_indices == -1).float(), dim=-1)
+return torch.gather(topk_indices, -1, order)
+```
+
+GPU 上没有高效的 `filter` 操作，所以用 **sort + gather** 实现"有效元素压缩到前面"：
+
+1. `(topk_indices == -1).float()`：有效位置 → `0.0`，无效位置 → `1.0`
+2. `torch.sort` 升序：`0.0` 排前面，`1.0` 排后面。**不关心排序后的值**（`_` 丢弃）要 `order`——重排下标
+3. `torch.gather` 按 `order` 重排原数组
+
+```
+排序键:  [1.0, 1.0, 0.0, 1.0, 1.0]
+排序后:  [0.0, 1.0, 1.0, 1.0, 1.0]
+order:   [2,   0,   1,   3,   4]      ← "排序后第 0 位来自原下标 2"
+
+gather:  topk_indices[2, 0, 1, 3, 4] = [1, -1, -1, -1, -1]
+```
+
+有效索引 `1` 被排到了最前面。下游只需数前面非 -1 的个数就知道本 rank 实际要读多少个 KV position。
+
 ---
 
 ## NPU 执行单元：AICORE vs AICPU
