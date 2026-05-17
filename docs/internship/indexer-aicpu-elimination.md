@@ -129,6 +129,13 @@ def _compute_local_indices(self, topk_indices: torch.Tensor) -> torch.Tensor:
 
 ## 精度保证
 
+### 精度分场景分析
+
+| 场景 | `1.0/dcp_size` 的 float32 表示 | 精度 | 措施 |
+|------|-------------------------------|------|------|
+| `dcp_size` 为 **2 的幂**（1, 2, 4, 8, 16...） | **精确**（`2^-k`） | 全链路零舍入 | 走 float32 快速路径 |
+| `dcp_size` 非 2 次幂（3, 5, 6, 7...） | 存在舍入 | 商可能偏差 ±1，index 被错误分配 | Fallback 回原始 int32 路径 |
+
 ### 为什么 2 的幂是安全的
 
 `dcp_size=8` 时，`1.0/8 = 0.125 = 2^-3`，在 float32 中**精确表示**（二进制小数 `0.001`），整条计算链零舍入误差。
@@ -140,6 +147,29 @@ def _compute_local_indices(self, topk_indices: torch.Tensor) -> torch.Tensor:
 ### 为什么 int→float 转换不丢精度
 
 `topk_indices` 值域为 `[0, num_blocks)`，远小于 float32 精确整数上限 `2^24 = 16,777,216`。
+
+### 精度验证
+
+用测试作业（`moe3b_oe_dsa_npu_910c`）跑优化前后对比，**prefill 和 decode 的 logits 输出 md5 完全对齐**——证明 float32 路径与原始 int32 路径严格等价，输出 bit-exact 一致。
+
+---
+
+## Timeline 表现
+
+### 优化前
+
+Profiling timeline 上，每个 attention 层的 SFA（Sparse Flash Attention）前有一个明显的 **`aclnnFloorDivides_FloorDivAiCpu_FloorDiv`** 色块，耗时约 **~4ms**。AICORE 流水线在 `EVENT_WAIT` 中等待 AICPU 算完才能开始 SFA——这个等待就是纯浪费。
+
+### 优化后
+
+FloorDiv AICPU 色块消失，替换为几个很窄的 AICORE Cast+Mul 算子，几乎不可见。SFA 紧接前序算子执行，无 EVENT_WAIT 阻塞。
+
+### 端到端性能（128k prompt, DCP8, 不抓 profiling）
+
+| 配置 | chunk=256 耗时 |
+|------|---------------|
+| Baseline（AlltoAll 优化） | 400,225 ms |
+| + FloorDiv 优化 | 356,524 ms（**提升 10.9%**） |
 
 ---
 
