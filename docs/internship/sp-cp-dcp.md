@@ -223,6 +223,120 @@ if tensor_model_parallel_size == decode_context_model_parallel_size:
 
 ---
 
+## PCP：Ares 中 SP 的实现
+
+### PCP 是什么
+
+PCP（Prefill Context Parallelism）是 Ares 框架中 SP 在 prefill 阶段的具体实现。配置名为 `prefill_context_parallel_size`，默认值为 1（不开启）。
+
+```python
+# config.py
+prefill_context_parallel_size: int = 1    # PCP 默认关
+decode_context_parallel_size: int = 1     # DCP 默认关
+```
+
+PCP 的本质就是 SP——把序列切给多个 rank，每个 rank 只处理一部分 token。在 Ares 中 PCP 复用 TP group 的卡（和 DCP 一样），不增加总卡数。
+
+### 投影不受影响
+
+PCP 不改变 QKV 投影的 TP 切分方式。ColumnParallel / RowParallel 按 head 维度切，**和没开 PCP 时完全一样**。唯一的区别是每个 rank 输入的 token 数变少了：
+
+```
+不开 PCP（pcp=1），每个 rank 的投影：
+  hidden_states[S, H] → q_a_proj → [S, 1536] → q_b_proj → [S, H/tp, 192]
+                       → kv_a_proj → [S, 512] → kv_b_proj → [S, H/tp, 576]
+
+开 PCP=2，每个 rank 的投影：
+  hidden_states[S/2, H] → q_a_proj → [S/2, 1536] → q_b_proj → [S/2, H/tp, 192]
+                         → kv_a_proj → [S/2, 512] → kv_b_proj → [S/2, H/tp, 576]
+```
+
+投影权重和 TP 切法不变，只是过投影的 token 数从 S 变成 S/pcp。
+
+### Attention 阶段：AllGather KV
+
+投影完后，每个 PCP rank 只有 1/pcp 的 KV。但 causal attention 要求每个 Q 都能看到自己之前的所有 KV，所以需要 **AllGather KV**：
+
+```
+PCP=2 的 Prefill Attention 流程：
+
+rank 0: hidden[0:S/2] → 投影 → Q[0:S/2], KV[0:S/2]
+rank 1: hidden[S/2:S] → 投影 → Q[S/2:S], KV[S/2:S]
+                                    ↓
+                          AllGather KV（投影后的压缩 latent）
+                                    ↓
+rank 0: Q[0:S/2] × KV_full[0:S]   → attention
+rank 1: Q[S/2:S] × KV_full[0:S]   → attention
+```
+
+AllGather 的是**投影后的 KV**（MLA 压缩 latent 512d + k_pe 64d = 576d），不是原始 hidden_states（5120d）。通信量只有原始的 ~1/9。
+
+AllGather 出来的完整 KV 是**临时的**——用完 attention 就丢掉，不持久化。
+
+### KV Cache 的存储：交错分片
+
+开了 PCP 后，PCP 和 DCP 被"压平"成一个统一的 CP 维度：
+
+```python
+total_cp_rank = pcp_rank * dcp_world_size + dcp_rank
+total_cp_world_size = pcp_world_size * dcp_world_size
+```
+
+KV Cache 按 `cp_kv_cache_interleave_size`（记为 I）轮流分配给各 rank：
+
+```
+token 归属 = (position // I) % total_cp_world_size
+
+示例：pcp=2, dcp=2, I=1（total_cp_world_size=4）:
+  token 0 → rank 0 (pcp=0, dcp=0)
+  token 1 → rank 1 (pcp=0, dcp=1)
+  token 2 → rank 2 (pcp=1, dcp=0)
+  token 3 → rank 3 (pcp=1, dcp=1)
+  token 4 → rank 0 ...
+```
+
+写 KV Cache 时，每个 rank **只存属于自己的那些 position**，其他位置的 slot_mapping = -1（跳过）。
+
+### Chunked Prefill 下的完整流程
+
+长 prompt 被切成多个 chunk 逐个处理。以 PCP=2, chunk_size=2048 为例：
+
+```
+chunk 0（第一个 chunk，无历史 cache）：
+  rank 0: 处理 token[0:1024]
+    → 投影得到 Q[0:1024], KV[0:1024]
+    → AllGather KV → 得到 KV_full[0:2048]
+    → Attention: Q[0:1024] × KV_full[0:2048]
+    → 写 cache: 只存偶数 token 位置（按 interleave 分配）
+
+  rank 1: 处理 token[1024:2048]
+    → 投影得到 Q[1024:2048], KV[1024:2048]
+    → AllGather KV → 得到 KV_full[0:2048]
+    → Attention: Q[1024:2048] × KV_full[0:2048]
+    → 写 cache: 只存奇数 token 位置
+
+chunk 1（第二个 chunk，有 cache 了）：
+  需要看两部分 KV:
+  ① 当前 chunk 的 KV（freshly projected → AllGather）
+  ② 之前 chunk 的 KV（从 cache 读取，每个 rank 只有 1/total_cp_world_size）
+
+  对 prefix 部分的 attention 需要先 AllGather 历史 KV cache
+  或者用 DCP 风格的 local FA + merge
+```
+
+### 计算量收益
+
+每个 PCP rank 只算 S/pcp 个 Q 的 attention，**计算量降到 1/pcp**。代价是每层一次 AllGather KV 通信。
+
+```
+不开 PCP: 每个 rank 算 S 个 Q × S 个 KV = O(S²d)
+开 PCP=2: 每个 rank 算 S/2 个 Q × S 个 KV = O(S²d/2)  ← 省一半计算
+```
+
+通信代价：AllGather 投影后的 KV（576d × S/pcp × bf16 = ~1.2KB/token）。序列越长、计算/通信比越高，PCP 收益越大。
+
+---
+
 ## 三者的正交关系
 
 SP、CP、DCP 解决不同层面的问题，可以同时使用：
@@ -282,5 +396,21 @@ A: AllGather 一次性把所有 KV 收集到每个 rank，显存需要存完整 
 **Q: DCP 为什么不用 ring 而用 AllGather Q + 本地 FA？**
 
 A: decode 时 Q 只有 1 个 token，传 Q（AllGather）比传 KV（ring）便宜得多。Q 的大小是 `B × H × d`（几十 KB），KV 的大小是 `S × d`（几十到几百 MB）。传小的 Q 一次，比传大的 KV 转一圈高效。
+
+**Q: PCP（Ares 的 SP 实现）和标准 SP 有什么区别？**
+
+A: 标准 SP 只切 LayerNorm/残差这些非 TP 区域，attention 内部不动。PCP 更进一步——把序列也切进 attention 内部：每个 rank 只有 S/pcp 个 Q，但通过 AllGather 拿到完整 KV 做 attention。所以 PCP 既省 activation 显存（和 SP 一样），又**省 attention 计算量**（降到 1/pcp）。
+
+**Q: PCP 开了之后 QKV 投影怎么切的？**
+
+A: 投影的 TP 切分不变（ColumnParallel 按 head 切），只是每个 rank 输入的 token 数从 S 变成 S/pcp。投影后 AllGather 的是 KV（MLA 压缩 latent 576d），不是 hidden_states（5120d），通信量只有 ~1/9。
+
+**Q: PCP 开了之后 KV Cache 怎么存？**
+
+A: PCP 和 DCP 被压平成一个统一的 CP 维度：`total_cp_world_size = pcp_size × dcp_size`。KV Cache 按 interleave 粒度轮流分配——每个 rank 只存 1/total_cp_world_size 的 token。写 cache 时 slot_mapping 里只有属于本 rank 的位置有效，其他位置为 -1 跳过。
+
+**Q: PCP 的 AllGather KV 通信量大吗？**
+
+A: AllGather 的是投影后的 MLA 压缩 latent（576d × bf16 = 1152B/token），比 AllGather 原始 hidden（5120d）小约 9 倍。S=128k, pcp=2 时每个 rank AllGather 64k × 1152B ≈ 72MB，在 NVLink 上约 1-2ms。序列越长收益越大——省的 attention 计算远超通信开销。
 
 :::
