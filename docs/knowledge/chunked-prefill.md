@@ -68,7 +68,12 @@ positions_np = num_computed_tokens + arange
 对于 chunked prefill 的第 2 个 chunk（`num_computed_tokens=2048, num_scheduled_tokens=2048`）：
 - positions = [2048, 2049, 2050, ..., 4095]
 
-Position 是**全局的**，RoPE 编码正确。
+Position 的作用：
+1. **RoPE 旋转角度**：每个 position 对应一个旋转角 `θ × pos`，分 chunk 计算时必须用全局 position 才能跟一次性算完整 prompt 的结果等价
+2. **KV Cache 写入位置（slot_mapping）**：`slot = block_table[pos // block_size][pos % block_size]`，position 决定了 token 的 KV 写入 paged cache 的哪个 slot
+3. **Causal Mask 判定**：attention kernel 用 position 判断因果关系——`Q[pos_i]` 只能看 `K[pos_j]`（j ≤ i）
+
+如果 position 从 0 开始重新计数，以上三者全部错误。
 
 ### seq_lens 计算
 
