@@ -367,6 +367,63 @@ SP、CP、DCP 解决不同层面的问题，可以同时使用：
 
 ---
 
+## TP/DCP 与 EP 的关系
+
+### 不同维度，不同组卡
+
+TP/DCP 和 EP 是**正交的并行维度**，作用在不同的卡组上：
+
+```
+典型配置：TP=8, DCP=8, EP=16, 总共 128 张卡（16 个节点，每节点 8 卡）
+
+节点内（8 张 NPU，NVLink 互联）：
+  TP group = 这 8 张卡（切 attention head / 权重）
+  DCP group = 这 8 张卡（切 KV Cache）
+  → 一个节点内是一个完整的 TP/DCP 组
+
+节点间（16 个节点，网络互联）：
+  EP = 16 → 每个节点是一个 EP rank
+  → 16 个节点各持有不同的专家
+  → All2All 跨节点交换 token 到对应专家所在的节点
+```
+
+### 为什么 EP 可以开很大，TP/DCP 不行
+
+| | TP / DCP | EP |
+|---|---|---|
+| 切什么 | 同一层的权重（head）/ KV Cache | 不同专家分到不同节点 |
+| 组内关系 | 同一组 8 张卡合力算一个 token | 不同组各算各的专家 |
+| 通信模式 | AllReduce / AllGather（每层每 token 都通信） | All2All（MoE 层交换 token） |
+| 通信频率 | 高频，每层多次 | 低频，只在 MoE 层 |
+| 带宽需求 | NVLink（900GB/s） | 网络即可（100-400Gb/s） |
+| 扩大的效果 | 单 token 算得更快 / 省显存 | 能装更多专家 |
+
+TP/DCP 限制在节点内（8 卡）是因为**通信太频繁**——每层的 AllReduce、AllGather 都需要 NVLink 的高带宽。EP 可以跨节点是因为 All2All 只发生在 MoE 层，且可以和计算 overlap。
+
+### MoE 模型的典型并行布局
+
+```
+                    ┌─────── EP=16（跨 16 个节点）────────┐
+                    │                                     │
+         ┌─ 节点 0 ─┐  ┌─ 节点 1 ─┐     ┌─ 节点 15 ─┐
+         │TP=8/DCP=8│  │TP=8/DCP=8│ ... │TP=8/DCP=8 │
+         │GPU 0-7   │  │GPU 8-15  │     │GPU 120-127│
+         │Expert 0-7│  │Expert 8-15│    │Expert 120-127│
+         └──────────┘  └──────────┘     └───────────┘
+
+Dense 层（Attention）：
+  节点内 TP AllReduce（NVLink，快）
+  节点间无通信
+
+MoE 层（MLP）：
+  节点间 All2All（网络）：每个 token 路由到对应专家所在的节点
+  节点内 TP AllReduce
+```
+
+Dense 层（Attention + LayerNorm）只在节点内通信（TP/DCP），MoE 层才需要跨节点通信（EP All2All）。所以 EP 开大不会影响 Dense 层的性能，只影响 MoE 层的 All2All 通信量。
+
+---
+
 ## 面试讲述要点
 
 ::: details 面试时怎么区分这三个？
