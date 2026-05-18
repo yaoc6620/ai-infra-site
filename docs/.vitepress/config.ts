@@ -75,6 +75,7 @@ export default withMermaid(
               { text: 'CUDA Graph', link: '/knowledge/vllm/cuda-graph' },
               { text: 'Model Runner', link: '/knowledge/vllm/model-runner' },
               { text: '投机解码', link: '/knowledge/vllm/speculative-decoding' },
+              { text: 'Chunked Prefill', link: '/knowledge/chunked-prefill' },
             ],
           },
           {
