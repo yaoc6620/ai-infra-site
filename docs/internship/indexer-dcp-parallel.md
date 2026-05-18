@@ -397,6 +397,33 @@ def forward(self, hidden_states, qr, rotary_emb):
 
 `mlp_lightning_indexer` 的计算量 ∝ S_q × S_kv。长序列下（S_kv=35000），单个 rank 算 `2048×35000` 需要 ~13ms。这个时间其他 7 个 rank 都在等 broadcast，产生严重的**负载不均衡**。
 
+### Indexer 的搜索范围：包含当前 chunk 的 K
+
+注意 Indexer forward 的执行顺序：**先把当前 chunk 的 K 写入 cache，再做 TopK 搜索**。
+
+```python
+# Indexer.forward 中的顺序：
+# ① 先写 cache
+torch_npu.npu_scatter_nd_update_(kv_cache, slot_mapping, k)
+
+# ② 再搜索（此时 cache 已经包含当前 chunk 的 K）
+topk_indices, _ = torch_npu.mlp_lightning_indexer(
+    query=q, key=kv_cache, ...)
+```
+
+所以 Indexer 搜索的 KV 范围是 **历史 KV + 当前 chunk 的 K**，不是只搜历史的：
+
+```
+假设 prefix=32952（之前积累的 KV），当前 chunk Sq=2048：
+
+  cache 内容 = 历史 32952 个 K + 当前 2048 个 K = 35000 个 K
+  搜索范围 = 全部 35000 个 K
+
+  cum_seq_lens = [0, 35000]  ← 包含当前 chunk
+```
+
+这也解释了为什么并行路径中 `kv_upper = prefix + my_end`——rank r 处理的 query chunk 能看到的 KV 上界包含了该 chunk 内前面 rank 的 K（已在 cache 中）。每个 query 做 TopK 时搜的是**完整的 35000 个 K**，但通过因果掩码保证 query token i 只能看到位置 ≤ i 的 K。
+
 ---
 
 ## 三、为什么可以优化
